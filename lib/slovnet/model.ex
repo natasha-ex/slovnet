@@ -2,58 +2,117 @@ defmodule Slovnet.Model do
   @moduledoc """
   Neural NER model: Navec embedding + shape embedding → CNN encoder → CRF head.
 
-  All operations use Nx tensors for pure Elixir inference.
+  Uses `defn` for JIT-compiled inference — the entire forward pass compiles
+  into a single XLA computation.
   """
 
-  defstruct [:navec, :shape_weight, :encoder_layers, :proj_weight, :proj_bias, :crf_transitions]
+  import Nx.Defn
 
-  @type t :: %__MODULE__{
-          navec: Slovnet.Navec.t(),
-          shape_weight: Nx.Tensor.t(),
-          encoder_layers: [map()],
-          proj_weight: Nx.Tensor.t(),
-          proj_bias: Nx.Tensor.t(),
-          crf_transitions: Nx.Tensor.t()
-        }
+  defstruct [:params, :navec_indexes, :navec_codes, :predict_fn]
 
-  alias Slovnet.{Navec, Pack}
+  alias Slovnet.Pack
 
   def load(ner_path, navec) do
     {:ok, model_json} = Pack.read_json(ner_path, "model.json")
-
     arrays = load_arrays(ner_path, model_json)
-    encoder_layers = load_encoder_layers(model_json["encoder"]["layers"], arrays)
+    layers = load_encoder_layers(model_json["encoder"]["layers"], arrays)
 
     head = model_json["head"]
-    proj = head["proj"]
-    crf = head["crf"]
+
+    params = %{
+      shape_weight: arrays[model_json["emb"]["shape"]["weight"]["array"]],
+      proj_weight: arrays[head["proj"]["weight"]["array"]],
+      proj_bias: arrays[head["proj"]["bias"]["array"]],
+      crf_transitions: arrays[head["crf"]["transitions"]["array"]],
+      layers: layers
+    }
+
+    predict_fn = Nx.Defn.jit(&predict/5, compiler: EXLA)
 
     %__MODULE__{
-      navec: navec,
-      shape_weight: arrays[model_json["emb"]["shape"]["weight"]["array"]],
-      encoder_layers: encoder_layers,
-      proj_weight: arrays[proj["weight"]["array"]],
-      proj_bias: arrays[proj["bias"]["array"]],
-      crf_transitions: arrays[crf["transitions"]["array"]]
+      params: params,
+      navec_indexes: navec.indexes,
+      navec_codes: navec.codes,
+      predict_fn: predict_fn
     }
   end
 
-  def forward(%__MODULE__{} = model, word_ids, shape_ids, pad_mask) do
-    word_emb = Navec.lookup_tensor(model.navec, word_ids)
-    shape_emb = Nx.take(model.shape_weight, shape_ids)
-    x = Nx.concatenate([word_emb, shape_emb], axis: -1)
-
-    x = encode(x, model.encoder_layers, pad_mask)
-    linear(x, model.proj_weight, model.proj_bias)
+  def run(%__MODULE__{} = model, word_ids, shape_ids, pad_mask) do
+    idx = navec_word_indices(model.navec_indexes, word_ids)
+    model.predict_fn.(model.params, model.navec_codes, idx, shape_ids, pad_mask)
   end
 
-  def decode_crf(%__MODULE__{crf_transitions: transitions}, emissions, pad_mask) do
+  defp navec_word_indices(indexes, word_ids) do
+    flat = Nx.reshape(word_ids, {:auto})
+    Nx.take(indexes, flat) |> Nx.as_type(:s64)
+  end
+
+  @doc false
+  defn predict(params, navec_codes, navec_idx, shape_ids, pad_mask) do
+    word_emb = navec_gather(navec_codes, navec_idx)
+    word_emb = reshape_emb(word_emb, shape_ids)
+
+    shape_emb = Nx.take(params.shape_weight, shape_ids)
+    x = Nx.concatenate([word_emb, shape_emb], axis: -1)
+
+    x = encode(x, params.layers, pad_mask)
+    linear(x, params.proj_weight, params.proj_bias)
+  end
+
+  deftransformp reshape_emb(word_emb, shape_ids) do
+    emb_dim = elem(Nx.shape(word_emb), 1)
+    out_shape = shape_ids |> Nx.shape() |> Tuple.to_list() |> Kernel.++([emb_dim]) |> List.to_tuple()
+    Nx.reshape(word_emb, out_shape)
+  end
+
+  defnp encode(x, layers, pad_mask) do
+    x = Nx.transpose(x, axes: [0, 2, 1])
+    mask = Nx.new_axis(pad_mask, 1)
+
+    x = cnn_layer(x, mask, layers[0])
+    x = cnn_layer(x, mask, layers[1])
+    x = cnn_layer(x, mask, layers[2])
+
+    Nx.transpose(x, axes: [0, 2, 1])
+  end
+
+  defnp cnn_layer(x, mask, layer) do
+    x = Nx.conv(x, layer.weight, padding: [{1, 1}])
+    x = Nx.add(x, Nx.reshape(layer.bias, {1, :auto, 1}))
+    x = Nx.max(x, 0)
+
+    mean = Nx.reshape(layer.bn_mean, {1, :auto, 1})
+    std = Nx.reshape(layer.bn_std, {1, :auto, 1})
+    w = Nx.reshape(layer.bn_weight, {1, :auto, 1})
+    b = Nx.reshape(layer.bn_bias, {1, :auto, 1})
+
+    x = (x - mean) / std * w + b
+
+    expanded_mask = Nx.broadcast(mask, Nx.shape(x))
+    Nx.select(expanded_mask, Nx.tensor(0.0, type: Nx.type(x)), x)
+  end
+
+  defnp linear(input, weight, bias) do
+    Nx.dot(input, [2], weight, [0]) + bias
+  end
+
+  defnp navec_gather(codes, idx) do
+    {n, qdim} = Nx.shape(idx)
+    {_qdim, _centroids, chunk} = Nx.shape(codes)
+
+    q_range = Nx.iota({1, qdim}, type: :s64) |> Nx.broadcast({n, qdim})
+    indices = Nx.stack([q_range, idx], axis: -1)
+
+    gathered = Nx.gather(codes, indices)
+    Nx.reshape(gathered, {n, qdim * chunk})
+  end
+
+  def decode_crf(%__MODULE__{params: params}, emissions, pad_mask) do
     {batch_size, seq_len, tags_num} = Nx.shape(emissions)
 
-    # Convert to lists for fast scalar access
     emissions_list = Nx.to_list(emissions)
     mask_list = Nx.to_list(pad_mask)
-    trans = Nx.to_list(transitions)
+    trans = Nx.to_list(params.crf_transitions)
 
     for b <- 0..(batch_size - 1) do
       b_emissions = Enum.at(emissions_list, b)
@@ -92,51 +151,6 @@ defmodule Slovnet.Model do
     end
   end
 
-  defp encode(x, layers, pad_mask) do
-    x = Nx.transpose(x, axes: [0, 2, 1])
-    mask = Nx.new_axis(pad_mask, 1)
-
-    x =
-      Enum.reduce(layers, x, fn layer, x ->
-        x = conv1d(x, layer.weight, layer.bias, layer.padding)
-        x = Nx.max(x, 0)
-        x = batch_norm(x, layer.bn_weight, layer.bn_bias, layer.bn_mean, layer.bn_std)
-
-        expanded_mask = Nx.broadcast(mask, Nx.shape(x))
-        Nx.select(expanded_mask, Nx.tensor(0.0, type: Nx.type(x)), x)
-      end)
-
-    Nx.transpose(x, axes: [0, 2, 1])
-  end
-
-  defp conv1d(input, weight, bias, padding) do
-    # input: {batch, channels, seq}, weight: {filters, channels, kernel}
-    # Nx.conv expects input {batch, channels, spatial...}, kernel {filters, channels, spatial...}
-    result = Nx.conv(input, weight, padding: [{padding, padding}])
-    Nx.add(result, Nx.reshape(bias, {1, :auto, 1}))
-  end
-
-  defp batch_norm(input, weight, bias, mean, std) do
-    mean = Nx.reshape(mean, {1, :auto, 1})
-    std = Nx.reshape(std, {1, :auto, 1})
-    weight = Nx.reshape(weight, {1, :auto, 1})
-    bias = Nx.reshape(bias, {1, :auto, 1})
-
-    input
-    |> Nx.subtract(mean)
-    |> Nx.divide(std)
-    |> Nx.multiply(weight)
-    |> Nx.add(bias)
-  end
-
-  defp linear(input, weight, bias) do
-    {b, s, _d} = Nx.shape(input)
-    {in_dim, out_dim} = Nx.shape(weight)
-    flat = Nx.reshape(input, {b * s, in_dim})
-    result = Nx.add(Nx.dot(flat, weight), bias)
-    Nx.reshape(result, {b, s, out_dim})
-  end
-
   defp load_arrays(ner_path, model_json) do
     weights = collect_weights(model_json, [])
 
@@ -161,19 +175,21 @@ defmodule Slovnet.Model do
   defp collect_weights(_, acc), do: acc
 
   defp load_encoder_layers(layers_json, arrays) do
-    Enum.map(layers_json, fn layer ->
+    layers_json
+    |> Enum.with_index()
+    |> Map.new(fn {layer, i} ->
       conv = layer["conv"]
       norm = layer["norm"]
 
-      %{
-        weight: arrays[conv["weight"]["array"]],
-        bias: arrays[conv["bias"]["array"]],
-        padding: conv["padding"],
-        bn_weight: arrays[norm["weight"]["array"]],
-        bn_bias: arrays[norm["bias"]["array"]],
-        bn_mean: arrays[norm["mean"]["array"]],
-        bn_std: arrays[norm["std"]["array"]]
-      }
+      {i,
+       %{
+         weight: arrays[conv["weight"]["array"]],
+         bias: arrays[conv["bias"]["array"]],
+         bn_weight: arrays[norm["weight"]["array"]],
+         bn_bias: arrays[norm["bias"]["array"]],
+         bn_mean: arrays[norm["mean"]["array"]],
+         bn_std: arrays[norm["std"]["array"]]
+       }}
     end)
   end
 end

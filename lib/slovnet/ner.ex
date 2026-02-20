@@ -11,15 +11,12 @@ defmodule Slovnet.NER do
       # [%{type: "PER", text: "Владимир Путин"}, %{type: "PER", text: "Ангелой Меркель"}, %{type: "LOC", text: "Кремле"}]
   """
 
-  defstruct [:model, :words_vocab, :shapes_vocab, :tags_vocab, :batch_size]
+  defstruct [:model, :words_vocab, :shapes_vocab, :tags_vocab]
 
   alias Slovnet.{BIO, Model, Navec, Pack, Shape, Tokenizer, Vocab}
 
-  @default_batch_size 8
-
   def load(opts \\ []) do
     models_dir = Keyword.get(opts, :models_dir, default_models_dir())
-    batch_size = Keyword.get(opts, :batch_size, @default_batch_size)
 
     navec_path = Path.join(models_dir, "navec_news_v1_1B_250K_300d_100q.tar")
     ner_path = Path.join(models_dir, "slovnet_ner_news_v1.tar")
@@ -35,8 +32,7 @@ defmodule Slovnet.NER do
       model: model,
       words_vocab: Vocab.new(words_items),
       shapes_vocab: Vocab.new(shapes_items),
-      tags_vocab: Vocab.new(tags_items),
-      batch_size: batch_size
+      tags_vocab: Vocab.new(tags_items)
     }
   end
 
@@ -47,7 +43,7 @@ defmodule Slovnet.NER do
     {word_ids, shape_ids} = encode(ner, words)
     pad_mask = Nx.equal(word_ids, ner.words_vocab.pad_id)
 
-    emissions = Model.forward(ner.model, word_ids, shape_ids, pad_mask)
+    emissions = Model.run(ner.model, word_ids, shape_ids, pad_mask)
     [tag_ids] = Model.decode_crf(ner.model, emissions, pad_mask)
 
     tags = Enum.map(tag_ids, &Vocab.decode(ner.tags_vocab, &1))
