@@ -24,12 +24,12 @@ defmodule Slovnet.Shape do
       Regex.match?(@ru_re, word) -> "RU"
       Regex.match?(@en_re, word) -> "EN"
       Regex.match?(@num_re, word) -> "NUM"
-      is_punct?(word) -> "PUNCT"
+      punct?(word) -> "PUNCT"
       true -> "OTHER"
     end
   end
 
-  defp is_punct?(word) do
+  defp punct?(word) do
     word
     |> String.graphemes()
     |> Enum.all?(&MapSet.member?(@puncts, &1))

@@ -13,8 +13,17 @@ defmodule Slovnet.NER do
 
   defstruct [:model, :words_vocab, :shapes_vocab, :tags_vocab]
 
+  @type t :: %__MODULE__{}
+  @type span :: %{
+          type: String.t(),
+          text: String.t(),
+          start: non_neg_integer(),
+          stop: non_neg_integer()
+        }
+
   alias Slovnet.{BIO, Model, Navec, Pack, Shape, Tokenizer, Vocab}
 
+  @spec load(keyword()) :: t()
   def load(opts \\ []) do
     models_dir = Keyword.get(opts, :models_dir, default_models_dir())
 
@@ -36,6 +45,7 @@ defmodule Slovnet.NER do
     }
   end
 
+  @spec extract(t(), String.t()) :: [span()]
   def extract(%__MODULE__{} = ner, text) when is_binary(text) do
     tokens = Tokenizer.tokenize(text)
     words = Enum.map(tokens, & &1.text)

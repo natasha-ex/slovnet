@@ -7,30 +7,33 @@ defmodule Slovnet.BIO do
 
   def spans_from_bio(tokens, tags) do
     {spans, current} =
-      Enum.zip(tokens, tags)
-      |> Enum.reduce({[], nil}, fn {token, tag}, {spans, current} ->
-        case parse_bio(tag) do
-          {"B", type} ->
-            spans = if current, do: [current | spans], else: spans
-            {spans, %__MODULE__{type: type, start: token.start, stop: token.stop}}
+      tokens
+      |> Enum.zip(tags)
+      |> Enum.reduce({[], nil}, &process_token/2)
 
-          {"I", type} ->
-            if current && current.type == type do
-              {spans, %{current | stop: token.stop}}
-            else
-              spans = if current, do: [current | spans], else: spans
-              {spans, %__MODULE__{type: type, start: token.start, stop: token.stop}}
-            end
-
-          _ ->
-            spans = if current, do: [current | spans], else: spans
-            {spans, nil}
-        end
-      end)
-
-    spans = if current, do: [current | spans], else: spans
-    Enum.reverse(spans)
+    maybe_close(spans, current) |> Enum.reverse()
   end
+
+  defp process_token({token, tag}, {spans, current}) do
+    case parse_bio(tag) do
+      {"B", type} ->
+        {maybe_close(spans, current),
+         %__MODULE__{type: type, start: token.start, stop: token.stop}}
+
+      {"I", type} when current != nil and current.type == type ->
+        {spans, %{current | stop: token.stop}}
+
+      {"I", type} ->
+        {maybe_close(spans, current),
+         %__MODULE__{type: type, start: token.start, stop: token.stop}}
+
+      _ ->
+        {maybe_close(spans, current), nil}
+    end
+  end
+
+  defp maybe_close(spans, nil), do: spans
+  defp maybe_close(spans, current), do: [current | spans]
 
   defp parse_bio("O"), do: {"O", nil}
   defp parse_bio("B-" <> type), do: {"B", type}

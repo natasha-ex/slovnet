@@ -23,14 +23,18 @@ defmodule Slovnet.MixProject do
     [
       {:nx, "~> 0.7"},
       {:exla, "~> 0.7", optional: true},
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
   end
 
   defp package do
     [
+      maintainers: ["Danila Poyarkov"],
       licenses: ["MIT"],
-      links: %{"GitHub" => "https://github.com/dannote/slovnet"}
+      links: %{"GitHub" => "https://github.com/natasha-ex/slovnet"},
+      files: ~w(lib .formatter.exs mix.exs README.md LICENSE)
     ]
   end
 end

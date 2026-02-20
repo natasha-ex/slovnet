@@ -10,8 +10,11 @@ defmodule Slovnet.Model do
 
   defstruct [:params, :navec_indexes, :navec_codes, :predict_fn, :crf_trans_list]
 
+  @type t :: %__MODULE__{}
+
   alias Slovnet.Pack
 
+  @spec load(String.t(), Slovnet.Navec.t()) :: t()
   def load(ner_path, navec) do
     {:ok, model_json} = Pack.read_json(ner_path, "model.json")
     arrays = load_arrays(ner_path, model_json)
@@ -41,6 +44,7 @@ defmodule Slovnet.Model do
     }
   end
 
+  @spec run(t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
   def run(%__MODULE__{} = model, word_ids, shape_ids, pad_mask) do
     flat = Nx.reshape(word_ids, {:auto})
     idx = Nx.take(model.navec_indexes, flat)
@@ -62,7 +66,10 @@ defmodule Slovnet.Model do
 
   deftransformp reshape_emb(word_emb, shape_ids) do
     emb_dim = elem(Nx.shape(word_emb), 1)
-    out_shape = shape_ids |> Nx.shape() |> Tuple.to_list() |> Kernel.++([emb_dim]) |> List.to_tuple()
+
+    out_shape =
+      shape_ids |> Nx.shape() |> Tuple.to_list() |> Kernel.++([emb_dim]) |> List.to_tuple()
+
     Nx.reshape(word_emb, out_shape)
   end
 
@@ -108,59 +115,71 @@ defmodule Slovnet.Model do
     Nx.reshape(gathered, {n, qdim * chunk})
   end
 
+  @spec decode_crf(t(), Nx.Tensor.t(), Nx.Tensor.t()) :: [[non_neg_integer()]]
   def decode_crf(%__MODULE__{crf_trans_list: trans}, emissions, pad_mask) do
-    {batch_size, seq_len, tags_num} = Nx.shape(emissions)
+    {batch_size, _seq_len, tags_num} = Nx.shape(emissions)
 
     emissions_list = Nx.to_list(emissions)
     mask_list = Nx.to_list(pad_mask)
 
-    pad_history = List.to_tuple(List.duplicate(0, tags_num))
-
     for b <- 0..(batch_size - 1) do
-      b_emissions = Enum.at(emissions_list, b)
-      b_mask = Enum.at(mask_list, b)
-
-      score = Enum.at(b_emissions, 0) |> List.to_tuple()
-
-      {score, history} =
-        Enum.reduce(1..(seq_len - 1), {score, []}, fn t, {score, history} ->
-          if Enum.at(b_mask, t) == 1 do
-            {score, [pad_history | history]}
-          else
-            em = Enum.at(b_emissions, t) |> List.to_tuple()
-            viterbi_step(score, em, trans, tags_num)
-            |> then(fn {new_score, indexes} -> {new_score, [indexes | history]} end)
-          end
-        end)
-
-      best = tuple_argmax(score, tags_num)
-
-      Enum.reduce(history, [best], fn indexes, [current | _] = tags ->
-        [elem(indexes, current) | tags]
-      end)
+      viterbi_decode(
+        Enum.at(emissions_list, b),
+        Enum.at(mask_list, b),
+        trans,
+        tags_num
+      )
     end
   end
 
+  defp viterbi_decode(emissions, mask, trans, tags_num) do
+    pad_history = List.to_tuple(List.duplicate(0, tags_num))
+    [first_em | rest_ems] = emissions
+    [_first_mask | rest_masks] = mask
+    score = List.to_tuple(first_em)
+
+    {score, history} =
+      rest_ems
+      |> Enum.zip(rest_masks)
+      |> Enum.reduce({score, []}, fn {em, m}, {score, history} ->
+        if m == 1 do
+          {score, [pad_history | history]}
+        else
+          {new_score, indexes} = viterbi_step(score, List.to_tuple(em), trans, tags_num)
+          {new_score, [indexes | history]}
+        end
+      end)
+
+    best = tuple_argmax(score, tags_num)
+    backtrack(history, best)
+  end
+
   defp viterbi_step(score, em, trans, tags_num) do
-    Enum.reduce(0..(tags_num - 1), {[], []}, fn j, {scores_acc, idx_acc} ->
-      em_j = elem(em, j)
+    {scores, idxs} =
+      Enum.reduce(0..(tags_num - 1), {[], []}, fn j, {scores_acc, idx_acc} ->
+        {best_score, best_idx} = best_prev(score, trans, elem(em, j), j, tags_num)
+        {[best_score | scores_acc], [best_idx | idx_acc]}
+      end)
 
-      {best_score, best_idx} =
-        Enum.reduce(0..(tags_num - 1), {-1.0e30, 0}, fn i, {bs, bi} ->
-          v = elem(score, i) + elem(elem(trans, i), j) + em_j
-          if v > bs, do: {v, i}, else: {bs, bi}
-        end)
+    {scores |> Enum.reverse() |> List.to_tuple(), idxs |> Enum.reverse() |> List.to_tuple()}
+  end
 
-      {[best_score | scores_acc], [best_idx | idx_acc]}
+  defp best_prev(score, trans, em_j, j, tags_num) do
+    Enum.reduce(0..(tags_num - 1), {-1.0e30, 0}, fn i, {bs, bi} ->
+      v = elem(score, i) + elem(elem(trans, i), j) + em_j
+      if v > bs, do: {v, i}, else: {bs, bi}
     end)
-    |> then(fn {scores, idxs} ->
-      {scores |> Enum.reverse() |> List.to_tuple(),
-       idxs |> Enum.reverse() |> List.to_tuple()}
+  end
+
+  defp backtrack(history, best) do
+    Enum.reduce(history, [best], fn indexes, [current | _] = tags ->
+      [elem(indexes, current) | tags]
     end)
   end
 
   defp tuple_argmax(tuple, size) do
-    Enum.reduce(1..(size - 1), {elem(tuple, 0), 0}, fn i, {best_v, best_i} ->
+    1..(size - 1)
+    |> Enum.reduce({elem(tuple, 0), 0}, fn i, {best_v, best_i} ->
       v = elem(tuple, i)
       if v > best_v, do: {v, i}, else: {best_v, best_i}
     end)
