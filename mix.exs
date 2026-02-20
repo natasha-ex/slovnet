@@ -24,6 +24,7 @@ defmodule Slovnet.MixProject do
       {:nx, "~> 0.7"},
       {:exla, "~> 0.7", optional: true},
       {:jason, "~> 1.4"},
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
