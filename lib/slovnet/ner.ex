@@ -9,6 +9,10 @@ defmodule Slovnet.NER do
       ner = Slovnet.NER.load()
       spans = Slovnet.NER.extract(ner, "Владимир Путин встретился с Ангелой Меркель в Кремле.")
       # [%{type: "PER", text: "Владимир Путин"}, %{type: "PER", text: "Ангелой Меркель"}, %{type: "LOC", text: "Кремле"}]
+
+      # Batch mode — single forward pass for multiple texts:
+      results = Slovnet.NER.extract_batch(ner, ["Путин в Кремле.", "Сегодня погода."])
+      # [[%{type: "PER", ...}, %{type: "LOC", ...}], []]
   """
 
   defstruct [:model, :words_vocab, :shapes_vocab, :tags_vocab]
@@ -48,18 +52,46 @@ defmodule Slovnet.NER do
   @spec extract(t(), String.t()) :: [span()]
   def extract(%__MODULE__{} = ner, text) when is_binary(text) do
     tokens = Tokenizer.tokenize(text)
-    words = Enum.map(tokens, & &1.text)
 
-    {word_ids, shape_ids} = encode(ner, words)
+    {word_ids, shape_ids} = encode(ner, [Enum.map(tokens, & &1.text)])
     pad_mask = Nx.equal(word_ids, ner.words_vocab.pad_id)
 
     emissions = Model.run(ner.model, word_ids, shape_ids, pad_mask)
     [tag_ids] = Model.decode_crf(ner.model, emissions, pad_mask)
 
     tags = Enum.map(tag_ids, &Vocab.decode(ner.tags_vocab, &1))
-    spans = BIO.spans_from_bio(tokens, tags)
+    build_spans(text, tokens, tags)
+  end
 
-    Enum.map(spans, fn span ->
+  @spec extract_batch(t(), [String.t()]) :: [[span()]]
+  def extract_batch(%__MODULE__{}, []), do: []
+
+  def extract_batch(%__MODULE__{} = ner, texts) when is_list(texts) do
+    token_lists = Enum.map(texts, &Tokenizer.tokenize/1)
+    word_lists = Enum.map(token_lists, fn tokens -> Enum.map(tokens, & &1.text) end)
+
+    {word_ids, shape_ids} = encode(ner, word_lists)
+    pad_mask = Nx.equal(word_ids, ner.words_vocab.pad_id)
+
+    emissions = Model.run(ner.model, word_ids, shape_ids, pad_mask)
+    all_tag_ids = Model.decode_crf(ner.model, emissions, pad_mask)
+
+    [texts, token_lists, all_tag_ids]
+    |> Enum.zip()
+    |> Enum.map(fn {text, tokens, tag_ids} ->
+      tags =
+        tag_ids
+        |> Enum.take(length(tokens))
+        |> Enum.map(&Vocab.decode(ner.tags_vocab, &1))
+
+      build_spans(text, tokens, tags)
+    end)
+  end
+
+  defp build_spans(text, tokens, tags) do
+    tokens
+    |> BIO.spans_from_bio(tags)
+    |> Enum.map(fn span ->
       %{
         type: span.type,
         text: String.slice(text, span.start, span.stop - span.start),
@@ -69,19 +101,29 @@ defmodule Slovnet.NER do
     end)
   end
 
-  defp encode(%__MODULE__{} = ner, words) do
-    word_ids =
-      Enum.map(words, fn word ->
-        Vocab.encode(ner.words_vocab, String.downcase(word))
-      end)
+  defp encode(%__MODULE__{} = ner, word_lists) do
+    max_len = word_lists |> Enum.map(&length/1) |> Enum.max(fn -> 0 end)
 
-    shape_ids =
-      Enum.map(words, fn word ->
-        shape = Shape.word_shape(word)
-        Vocab.encode(ner.shapes_vocab, shape)
-      end)
+    {word_rows, shape_rows} =
+      word_lists
+      |> Enum.map(fn words ->
+        word_ids = Enum.map(words, &Vocab.encode(ner.words_vocab, String.downcase(&1)))
 
-    {Nx.tensor([word_ids], type: :s64), Nx.tensor([shape_ids], type: :s64)}
+        shape_ids =
+          Enum.map(words, fn w ->
+            Vocab.encode(ner.shapes_vocab, Shape.word_shape(w))
+          end)
+
+        {pad(word_ids, max_len, ner.words_vocab.pad_id),
+         pad(shape_ids, max_len, ner.shapes_vocab.pad_id)}
+      end)
+      |> Enum.unzip()
+
+    {Nx.tensor(word_rows, type: :s64), Nx.tensor(shape_rows, type: :s64)}
+  end
+
+  defp pad(list, max_len, pad_id) do
+    list ++ List.duplicate(pad_id, max_len - length(list))
   end
 
   defp default_models_dir do
