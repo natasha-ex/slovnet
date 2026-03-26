@@ -56,6 +56,49 @@ defmodule SlovnetTest do
     end
   end
 
+  describe "batch NER" do
+    test "extract_batch returns list of span lists", %{ner: ner} do
+      texts = [
+        "Владимир Путин рассказал.",
+        "Сегодня хорошая погода."
+      ]
+
+      results = Slovnet.NER.extract_batch(ner, texts)
+      assert length(results) == 2
+      assert [%{type: "PER", text: "Владимир Путин"}] = Enum.at(results, 0)
+      assert Enum.at(results, 1) == []
+    end
+
+    test "batch results match sequential", %{ner: ner} do
+      texts = [
+        "Татьяна Голикова рассказала в среду.",
+        "Президент прибыл в Москву из Санкт-Петербурга.",
+        "Сегодня хорошая погода."
+      ]
+
+      sequential = Enum.map(texts, &Slovnet.NER.extract(ner, &1))
+      batch = Slovnet.NER.extract_batch(ner, texts)
+
+      for {seq, bat} <- Enum.zip(sequential, batch) do
+        assert Enum.map(seq, &Map.take(&1, [:type, :text])) ==
+                 Enum.map(bat, &Map.take(&1, [:type, :text]))
+      end
+    end
+
+    test "extract_batch with empty list", %{ner: ner} do
+      assert Slovnet.NER.extract_batch(ner, []) == []
+    end
+
+    test "extract_batch with single text matches extract", %{ner: ner} do
+      text = "ООО «Газпром межрегионгаз» выступило истцом."
+      [batch_result] = Slovnet.NER.extract_batch(ner, [text])
+      single_result = Slovnet.NER.extract(ner, text)
+
+      assert Enum.map(batch_result, &Map.take(&1, [:type, :text])) ==
+               Enum.map(single_result, &Map.take(&1, [:type, :text]))
+    end
+  end
+
   describe "Shape" do
     test "Russian word shapes" do
       assert Slovnet.Shape.word_shape("Москва") == "RU_Xx"
